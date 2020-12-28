@@ -39,6 +39,9 @@ pub struct ApplyMsg {
 #[derive(Clone, Message)]
 pub struct State {
     #[prost(uint64)]
+    pub current_term: u64,
+
+    #[prost(uint64)]
     pub term: u64,
 
     #[prost(uint64, optional)]
@@ -52,6 +55,11 @@ impl State {
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
         self.term
+    }
+
+    /// The latest term server has seen.
+    pub fn current_term(&self) -> u64 {
+        self.current_term
     }
 
     /// Whether this peer believes it is the leader.
@@ -248,14 +256,67 @@ impl Node {
         let raft1 = raft.clone();
         let (tx, rx) = mpsc::channel::<TimeoutMsg>();
 
+        debug!("Starting background worker...");
         // spawn a background thred that handles timeouts: Election and Heartbeat(only leader)
         thread::spawn(move || loop {
             let raft = &mut raft1.lock().unwrap();
 
             // Election & Heartbeat timeout
             futures::executor::block_on(async {
-                let _election_delay = Delay::new(Duration::from_millis(random_timeout())).await;
-                let _hearbeat_delay = Delay::new(Duration::from_millis(200)).await;
+                let (election_tx, election_rx) = mpsc::channel::<u8>();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(random_timeout()));
+                    election_tx.send(1).unwrap();
+                });
+                thread::spawn(move || {
+                    futures::executor::block_on(async {
+                        // This is used for AppendEntries RPC from leader.
+                        // If the node does not receive this request from the leader, become candidate
+                        // and send RequestVote RPCs to all peers.
+                        let _hearbeat_delay =
+                            Delay::new(Duration::from_millis(random_timeout())).await;
+                    })
+                });
+                match election_rx.recv() {
+                    Ok(_) => {
+                        let mut vote_count = 0;
+                        let n = raft.peers.len();
+                        let state = Arc::get_mut(&mut raft.state).unwrap();
+                        // Did not receive a RequestVote even after timeouts.
+                        // Become candidate, send out request_vote to other peers.
+                        let mut rs = state.clone();
+                        debug!("Sending RequestVote to {} peers...", n - 1);
+                        for i in 0..n {
+                            rs.term += 1;
+                            let args = RequestVoteArgs {
+                                term: rs.term,
+                                candidate_id: raft.me as u64,
+                                last_log_term: 0,
+                                last_log_index: 0,
+                            };
+                            if i != raft.me {
+                                match raft.send_request_vote(i, args).recv() {
+                                    Ok(reply) => match reply {
+                                        Ok(reply) => {
+                                            // Term > CurrentTerm seen, update to the latest
+                                            // term.
+                                            //
+                                            // if reply.term > state.current_term {
+                                            //     state.current_term = reply.term;
+                                            // }
+                                            vote_count += if reply.vote_granted { 1 } else { 0 };
+                                        }
+                                        Err(e) => error!("{:#?}", e),
+                                    },
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        rs.is_leader = vote_count > (n / 2 + n % 2);
+                    }
+                    Err(_) => {}
+                }
+
                 match rx.try_recv() {
                     Ok(msg) => match msg {
                         TimeoutMsg::Election => {}
@@ -263,42 +324,7 @@ impl Node {
                     },
                     Err(e) => match e {
                         mpsc::TryRecvError::Disconnected => panic!(e),
-                        mpsc::TryRecvError::Empty => {
-                            let mut vote_count = 0;
-                            let n = raft.peers.len();
-                            let state = Arc::get_mut(&mut raft.state).unwrap();
-                            // Did not receive a RequestVote even after timeouts.
-                            // Become candidate, send out request_vote to other peers.
-                            let mut rs = state.clone();
-                            for i in 0..n {
-                                rs.term += 1;
-                                let args = RequestVoteArgs {
-                                    term: rs.term,
-                                    candidate_id: raft.me as u64,
-                                    last_log_term: 0,
-                                    last_log_index: 0,
-                                };
-                                if i != raft.me {
-                                    match raft.send_request_vote(i, args).recv() {
-                                        Ok(reply) => match reply {
-                                            Ok(reply) => {
-                                                // Term > CurrentTerm seen, update to the latest
-                                                // term.
-                                                //
-                                                // if reply.term > state.current_term {
-                                                //     state.current_term = reply.term;
-                                                // }
-                                                vote_count +=
-                                                    if reply.vote_granted { 1 } else { 0 };
-                                            }
-                                            Err(e) => error!("{:#?}", e),
-                                        },
-                                        Err(_) => {}
-                                    }
-                                }
-                            }
-                            rs.is_leader = vote_count > (n / 2 + n % 2);
-                        }
+                        mpsc::TryRecvError::Empty => {}
                     },
                 }
             });
@@ -341,9 +367,12 @@ impl Node {
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
+        let raft = self.raft.lock().unwrap();
+        let state = raft.state.clone();
         State {
-            term: self.term(),
-            is_leader: self.is_leader(),
+            current_term: state.current_term(),
+            term: state.term(),
+            is_leader: state.is_leader(),
             voted_for: None,
         }
     }
@@ -365,15 +394,28 @@ impl Node {
 impl RaftService for Node {
     /// RequestVote RPC handler.
     async fn request_vote(&self, _args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
-        // TODO RequestVote received, process
+        // RequestVote received by current node, process peers' request.
         self.tx
             .lock()
             .unwrap()
             .send(TimeoutMsg::Election)
             .map_err(|_| labrpc::Error::Stopped)?;
+        let raft = self.raft.lock().unwrap();
+        let state = raft.state.clone();
+        let mut vote_granted = false;
+
+        // Candidate's term is larger than current peer's term so grant vote.
+        if state.current_term() < _args.term {
+            vote_granted = true;
+            // TODO set is_leader to false, become follower if it's candidate.
+        }
+
+        // TODO if votedFor is `null` or `candidate_id`, and candidate's log is
+        // at least as up-to-date as receiver's log, grant vote.
+        // if state.voted().is_none() && _args.candidate_id
         Ok(RequestVoteReply {
-            term: 0,
-            vote_granted: false,
+            term: state.term(),
+            vote_granted,
         })
     }
 
